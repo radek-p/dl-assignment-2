@@ -2,4 +2,4 @@ data/
 experiments/
 .DS_Store
 .idea/
-
+logs/
