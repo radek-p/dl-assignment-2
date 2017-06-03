@@ -5,6 +5,7 @@ from time import sleep
 
 import math
 import numpy as np
+import select
 import tensorflow as tf
 import argparse
 import sys
@@ -148,6 +149,7 @@ class Trainer(object):
         self.generator = random.Random(self.parameters["seed"])
 
     def prepare_dataset(self, dataset_dir):
+        print("Loading dataset")
         self.dataset = Spacenet2Dataset(dataset_dir, self.generator, self.parameters["validation_set_size"])
         self.dataset.load_dataset()
 
@@ -161,16 +163,21 @@ class Trainer(object):
             # stddev = 2. / (kernel_size * kernel_size * in)
             stddev = 0.1
             print("stddevs: {} vs. {}".format(stddev, 0.1))
+
+            # tf.get_variable()
             W = tf.Variable(
                 tf.truncated_normal([kernel_size, kernel_size, in_fmaps, out_fmaps], stddev=stddev, dtype=self.float),
                 name="W")
-            b = tf.Variable(tf.truncated_normal([out_fmaps], stddev=0.1, dtype=self.float), name="b")
-            # b = tf.Variable(tf.constant([out_fmaps], dtype=self.float), name="b")
+            gamma = tf.Variable(tf.truncated_normal([in_fmaps], mean=1.0, stddev=0.1, dtype=self.float), name="b")
+            beta = tf.Variable(tf.truncated_normal([in_fmaps], stddev=0.1, dtype=self.float), name="b")
 
             tf.summary.histogram("conv_{}_W".format(depth), W)
-            tf.summary.histogram("conv_{}_b".format(depth), b)
+            tf.summary.histogram("conv_{}_gamma".format(depth), gamma)
+            tf.summary.histogram("conv_{}_beta".format(depth), beta)
 
-            signal = tf.nn.conv2d(signal, W, [1, 1, 1, 1], "SAME", name="up_conv_conv2d") + b
+            mean, variance = tf.nn.moments(signal, [0, 1, 2])
+            signal = tf.nn.batch_normalization(signal, mean, variance, beta, gamma, 1e-6, "batch_norm")
+            signal = tf.nn.conv2d(signal, W, [1, 1, 1, 1], "SAME", name="up_conv_conv2d")
 
             suffix = ""
             if include_relu:
@@ -195,19 +202,23 @@ class Trainer(object):
                 tf.truncated_normal([2, 2, out_fmaps, in_fmaps], stddev=stddev, dtype=self.float),
                 name="W"
             )
-            b = tf.Variable(tf.truncated_normal([out_fmaps], stddev=0.1, dtype=self.float), name="b")
+            # b = tf.Variable(tf.truncated_normal([out_fmaps], stddev=0.1, dtype=self.float), name="b")
+            gamma = tf.Variable(tf.truncated_normal([in_fmaps], mean=1.0, stddev=0.1, dtype=self.float), name="b")
+            beta = tf.Variable(tf.truncated_normal([in_fmaps], stddev=0.1, dtype=self.float), name="b")
             # signal = tf.image.resize_bilinear(signal, [target_h, target_w], name="up_conv_resize_bilinear")
             # signal = self.layer_conv(signal, depth + 1, in_fmaps, out_fmaps, 3, True)
+            mean, variance = tf.nn.moments(signal, [0, 1, 2])
+            signal = tf.nn.batch_normalization(signal, mean, variance, beta, gamma, 1e-6, "batch_norm")
+
             signal = tf.nn.conv2d_transpose(
                 signal,
                 W,
                 [int(signal.shape[0]), target_h, target_w, out_fmaps],
                 [1, 2, 2, 1],
                 name="upconv"
-            ) + b
+            )
 
             signal = tf.nn.relu(signal)
-
             self.print_layer_info(depth, "v   up conv(2x)", signal.shape)
             return signal
 
@@ -239,14 +250,39 @@ class Trainer(object):
                 self.print_layer_info(depth, "stack", signal.shape)
                 signal = self.layer_conv(signal, depth, 2 * out_fmaps, out_fmaps, 3)
                 signal = self.layer_conv(signal, depth, out_fmaps, out_fmaps, 3)
-
         return signal
 
-    def create_model(self):
-        print("Creating the model")
+    def transform(self, transform_id, image, is_image=False):
+        with tf.name_scope("image_transfrom"):
+            # overlay = tf.lin_space(0., 324., 325)
+            # overlay = tf.reshape(overlay, [1, 325, 1])
+            # overlay = tf.tile(overlay, [325,1,3])
+            # print("OVERLAY SHAPE: {}\n\n\n".format(overlay.shape))
+            # overlay1 = tf.sigmoid(10 - tf.square(overlay - tf.cast(10, tf.float32)))
+            # overlay2 = tf.sigmoid(10 - tf.square(overlay - tf.cast(40 * transform_id, tf.float32)))
+            # image = tf.maximum(image, overlay1)
 
-        with tf.name_scope("input_pipeline"):
-            image_name, heatmap_name = tf.train.slice_input_producer(self.dataset.get_training_set_filenames())
+            k = tf.mod(transform_id, 4, "rotation_idx")
+            rotated = tf.image.rot90(image, k, "rotation")
+
+            not_flipped = rotated
+            flipped = tf.image.flip_left_right(rotated)
+            signal = tf.cond(tf.equal(tf.div(transform_id, 4), 1), lambda: flipped, lambda: not_flipped)
+
+            # signal = tf.maximum(overlay2, signal)
+            # signal = tf.reshape(signal, [325, 325, 3])
+
+            signal.set_shape([325, 325, 3])
+            if is_image:
+                b, g, r = tf.unstack(signal, 3, 2)
+                signal = tf.stack([r, g, b], 2)
+                # signal = tf.image.per_image_standardization(signal)
+                signal *= 2.
+            return signal
+
+    def load_images(self, filename_queue):
+        with tf.name_scope("image_loading"):
+            image_name, heatmap_name = filename_queue
 
             image = tf.read_file(image_name)
             heatmap = tf.read_file(heatmap_name)
@@ -254,19 +290,44 @@ class Trainer(object):
             image = tf.image.decode_jpeg(image, name="jpeg_decoding_1")
             image.set_shape([650, 650, 3])
             image = tf.cast(image, self.float) / 255.
+            image = tf.reshape(image, [1, 650, 650, 3])
+            image = tf.image.resize_bilinear(image, size=[325, 325])
+            image = tf.reshape(image, [325, 325, 3])
 
-            heatmap = tf.image.decode_jpeg(heatmap, name="jpeg_decoding_1")
+            heatmap = tf.image.decode_jpeg(heatmap, name="jpeg_decoding_2")
             heatmap.set_shape([650, 650, 3])
             heatmap = tf.cast(heatmap, self.float) / 255.
+            heatmap = tf.reshape(heatmap, [1, 650, 650, 3])
+            heatmap = tf.image.resize_bilinear(heatmap, size=[325, 325])
+            heatmap = tf.reshape(heatmap, [325, 325, 3])
 
-            x_batch, y_batch = tf.train.shuffle_batch_join([(image, heatmap)] * 4, 8, 16, 0, name="shuffle_batch_join")
-            # reader = tf.WholeFileReader()
-            # key, value = reader.read(filename_queue)
+            return image, heatmap
 
-        # input_h, input_w = 325, 325
-        # target_h, target_w = 336, 336
-        input_h, input_w = 650, 650
-        target_h, target_w = 656, 656
+    def create_model(self):
+        print("Creating the model")
+
+        with tf.name_scope("input_pipeline"):
+            transformation_type = tf.random_uniform([], 0, 8, dtype=tf.int32, name="random_transformation_type")
+            filename_queue = tf.train.slice_input_producer(self.dataset.get_training_set_filenames())
+            image, heatmap = self.load_images(filename_queue)
+            image = self.transform(transformation_type, image, True)
+            heatmap = self.transform(transformation_type, heatmap, False)
+            x_batch, y_batch = tf.train.shuffle_batch_join([(image, heatmap)] * 24, 32, 512, 32,
+                                                           name="shuffle_batch_join")
+
+        with tf.name_scope("test_input_pipeline"):
+            vx_name = tf.placeholder(tf.string, [], "vx_name")
+            vy_name = tf.placeholder(tf.string, [], "vy_name")
+            image, heatmap = self.load_images((vx_name, vy_name))
+            images = [self.transform(transform_id, image, True) for transform_id in range(8)]
+            heatmaps = [self.transform(transform_id, heatmap, False) for transform_id in range(8)]
+            xv_batch = tf.stack(images, 0)
+            yv_batch = tf.stack(heatmaps, 0)
+
+        input_h, input_w = 325, 325
+        target_h, target_w = 336, 336
+        # input_h, input_w = 650, 650
+        # target_h, target_w = 656, 656
 
         with tf.name_scope("placeholders"):
             # global_step = tf.Variable(0, dtype=tf.int32, name="global_step")
@@ -323,21 +384,24 @@ class Trainer(object):
         for big_step in range(big_steps):  # tqdm(range(big_steps), desc="epochs"):
             # print("TEST", end="") # print here like this
             # inner_range =
-            for step in tqdm(range(small_steps), total=small_steps, desc="steps ", leave=True):
+            for small_step in tqdm(range(small_steps), total=small_steps, desc="steps ", leave=True):
                 _, merged_summaries, loss = self.session.run(
                     fetches=[
                         m["optimize_op"],
                         m["merged_summaries"],
                         m["loss"],
-
                     ],
                     feed_dict={
                         # m["global_step"]: big_step * big_steps + step
                     }
                 )
+                if select.select([sys.stdin, ], [], [], 0.0)[0]:
+                    command = input()
+                    if command == "t":
+                        tqdm.write("WOULD RUN TESTS NOW")
 
                 tqdm.write("loss: {}".format(loss))
-                m["summary_writer"].add_summary(merged_summaries, big_step * big_steps + step)
+                m["summary_writer"].add_summary(merged_summaries, big_step * big_steps + small_step)
 
             m["summary_writer"].flush()
             self.train_model__report_stats(big_step)
@@ -351,7 +415,7 @@ class Trainer(object):
             }
         )
         print()
-        print("Big step summary: {}".format(42))
+        print("Big step #{} done.".format(big_step))
         print("-----------------------------\n")
         # print("\n[{}] accuracy: {}".format(big_step, accuracy))
 
@@ -390,7 +454,10 @@ def main(argv):
     options = parser.parse_args(argv)
     print(options)
 
-    with tf.Session() as session:
+    config = tf.ConfigProto()
+    config.gpu_options.allow_growth = True
+
+    with tf.Session(config=config) as session:
         if options.debug:
             print("Running in debug mode")
             from tensorflow.python import debug as tf_debug
@@ -403,7 +470,6 @@ def main(argv):
             "verbosity": 3 if options.verbose else 0,
             "training_steps": options.training_steps,
         })
-        print("Loading dataset")
 
         t.prepare_dataset(dataset_dir=options.dataset)
         print("Creating model")
