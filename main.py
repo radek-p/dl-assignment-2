@@ -157,70 +157,49 @@ class Trainer(object):
         fst = "|   " * depth + str(fst)
         print(fst + " " * max(mlen - len(fst), 0) + str(snd))
 
-    def layer_conv(self, signal, depth, in_fmaps, out_fmaps, kernel_size, include_relu=True):
-        with tf.name_scope("conv_{}".format(depth)):
-            # stddev = math.sqrt(2./float((kernel_size ^ 2) * in_fmaps))
-            # stddev = 2. / (kernel_size * kernel_size * in)
-            stddev = 0.1
-            print("stddevs: {} vs. {}".format(stddev, 0.1))
+    def layer_conv(self, signal, depth, in_fmaps, out_fmaps, kernel_size, include_relu=True, is_training=True):
+        W = tf.get_variable(
+            "W", [kernel_size, kernel_size, in_fmaps, out_fmaps], self.float,
+            tf.truncated_normal_initializer(stddev=0.1)
+        )
 
-            # tf.get_variable()
-            W = tf.Variable(
-                tf.truncated_normal([kernel_size, kernel_size, in_fmaps, out_fmaps], stddev=stddev, dtype=self.float),
-                name="W")
-            gamma = tf.Variable(tf.truncated_normal([in_fmaps], mean=1.0, stddev=0.1, dtype=self.float), name="b")
-            beta = tf.Variable(tf.truncated_normal([in_fmaps], stddev=0.1, dtype=self.float), name="b")
+        tf.layers.batch_normalization(signal, 3, training=is_training)
+        tf.summary.histogram("conv_{}_W".format(depth), W)
 
-            tf.summary.histogram("conv_{}_W".format(depth), W)
-            tf.summary.histogram("conv_{}_gamma".format(depth), gamma)
-            tf.summary.histogram("conv_{}_beta".format(depth), beta)
+        signal = tf.nn.conv2d(signal, W, [1, 1, 1, 1], "SAME", name="up_conv_conv2d")
 
-            mean, variance = tf.nn.moments(signal, [0, 1, 2])
-            signal = tf.nn.batch_normalization(signal, mean, variance, beta, gamma, 1e-6, "batch_norm")
-            signal = tf.nn.conv2d(signal, W, [1, 1, 1, 1], "SAME", name="up_conv_conv2d")
-
-            suffix = ""
-            if include_relu:
-                signal = tf.nn.relu(signal)
-                suffix = " + ReLU"
-
-            self.print_layer_info(depth, "conv({} --> {}, {}){}".format(in_fmaps, out_fmaps, kernel_size, suffix),
-                                  signal.shape)
-            return signal
-
-    def layer_up_conv(self, signal, depth):
-        with tf.name_scope("up_conv"):
-            in_fmaps = int(signal.shape[3])
-            out_fmaps = in_fmaps // 2
-            target_h = int(signal.shape[1]) * 2
-            target_w = int(signal.shape[2]) * 2
-
-            print("infmaps = {}, outfmaps = {}".format(in_fmaps, out_fmaps))
-
-            stddev = 0.1
-            W = tf.Variable(
-                tf.truncated_normal([2, 2, out_fmaps, in_fmaps], stddev=stddev, dtype=self.float),
-                name="W"
-            )
-            # b = tf.Variable(tf.truncated_normal([out_fmaps], stddev=0.1, dtype=self.float), name="b")
-            gamma = tf.Variable(tf.truncated_normal([in_fmaps], mean=1.0, stddev=0.1, dtype=self.float), name="b")
-            beta = tf.Variable(tf.truncated_normal([in_fmaps], stddev=0.1, dtype=self.float), name="b")
-            # signal = tf.image.resize_bilinear(signal, [target_h, target_w], name="up_conv_resize_bilinear")
-            # signal = self.layer_conv(signal, depth + 1, in_fmaps, out_fmaps, 3, True)
-            mean, variance = tf.nn.moments(signal, [0, 1, 2])
-            signal = tf.nn.batch_normalization(signal, mean, variance, beta, gamma, 1e-6, "batch_norm")
-
-            signal = tf.nn.conv2d_transpose(
-                signal,
-                W,
-                [int(signal.shape[0]), target_h, target_w, out_fmaps],
-                [1, 2, 2, 1],
-                name="upconv"
-            )
-
+        suffix = ""
+        if include_relu:
             signal = tf.nn.relu(signal)
-            self.print_layer_info(depth, "v   up conv(2x)", signal.shape)
-            return signal
+            suffix = " + ReLU"
+
+        self.print_layer_info(depth, "conv({} --> {}, {}){}".format(in_fmaps, out_fmaps, kernel_size, suffix),
+                              signal.shape)
+        return signal
+
+    def layer_up_conv(self, signal, depth, is_training=True):
+        in_fmaps = int(signal.shape[3])
+        out_fmaps = in_fmaps // 2
+        target_h = int(signal.shape[1]) * 2
+        target_w = int(signal.shape[2]) * 2
+
+        W = tf.get_variable(
+            "W", [2, 2, out_fmaps, in_fmaps], self.float,
+            tf.truncated_normal_initializer(stddev=0.1)
+        )
+
+        signal = tf.layers.batch_normalization(signal, 3, training=is_training)
+        signal = tf.nn.conv2d_transpose(
+            signal,
+            W,
+            [int(signal.shape[0]), target_h, target_w, out_fmaps],
+            [1, 2, 2, 1],
+            name="upconv"
+        )
+        signal = tf.nn.relu(signal)
+
+        self.print_layer_info(depth, "v   up conv(2x)", signal.shape)
+        return signal
 
     def layer_max_pool_2x2(self, signal, depth):
         with tf.name_scope("max_pool"):
@@ -228,40 +207,36 @@ class Trainer(object):
             self.print_layer_info(depth, "|   max pool()", signal.shape)
             return signal
 
-    def create_u_level(self, levels, signal, in_fmaps, out_fmaps):
+    def create_u_level(self, levels, signal, in_fmaps, out_fmaps, is_training):
         depth = levels[0]
-        img_size = signal.shape[1]
-        with tf.name_scope("u_{}_begin".format(depth)):
-            signal = self.layer_conv(signal, depth, in_fmaps, out_fmaps, 3)
-            signal = self.layer_conv(signal, depth, out_fmaps, out_fmaps, 3)
-            skip_connection = signal
+        with tf.variable_scope("u_{}_conv1".format(depth)):
+            signal = self.layer_conv(signal, depth, in_fmaps, out_fmaps, 3, is_training)
+        with tf.variable_scope("u_{}_conv2".format(depth)):
+            signal = self.layer_conv(signal, depth, out_fmaps, out_fmaps, 3, is_training)
+
+        skip_connection = signal
 
         if len(levels) > 1:  # Not the last layer
-            with tf.name_scope("u_{}_step1".format(depth)):
+            with tf.name_scope("u_{}_max_pool".format(depth)):
                 signal = self.layer_max_pool_2x2(signal, depth)
 
-            signal = self.create_u_level(levels[1:], signal, out_fmaps, out_fmaps * 2)
+            signal = self.create_u_level(levels[1:], signal, out_fmaps, out_fmaps * 2, is_training)
 
-            with tf.name_scope("u_{}_step2".format(depth)):
+            with tf.variable_scope("u_{}_upconv".format(depth)):
                 signal = self.layer_up_conv(signal, depth)
 
-            with tf.name_scope("u_{}_end".format(depth)):
-                signal = tf.concat([skip_connection, signal], 3, "concat_skip_connection")
-                self.print_layer_info(depth, "stack", signal.shape)
-                signal = self.layer_conv(signal, depth, 2 * out_fmaps, out_fmaps, 3)
-                signal = self.layer_conv(signal, depth, out_fmaps, out_fmaps, 3)
+            signal = tf.concat([skip_connection, signal], 3, "concat_skip_connection")
+            self.print_layer_info(depth, "stack", signal.shape)
+
+            with tf.variable_scope("u_{}_conv3".format(depth)):
+                signal = self.layer_conv(signal, depth, 2 * out_fmaps, out_fmaps, 3, is_training)
+            with tf.variable_scope("u_{}_conv4".format(depth)):
+                signal = self.layer_conv(signal, depth, out_fmaps, out_fmaps, 3, is_training)
+
         return signal
 
-    def transform(self, transform_id, image, is_image=False):
+    def transform(self, transform_id, image):
         with tf.name_scope("image_transfrom"):
-            # overlay = tf.lin_space(0., 324., 325)
-            # overlay = tf.reshape(overlay, [1, 325, 1])
-            # overlay = tf.tile(overlay, [325,1,3])
-            # print("OVERLAY SHAPE: {}\n\n\n".format(overlay.shape))
-            # overlay1 = tf.sigmoid(10 - tf.square(overlay - tf.cast(10, tf.float32)))
-            # overlay2 = tf.sigmoid(10 - tf.square(overlay - tf.cast(40 * transform_id, tf.float32)))
-            # image = tf.maximum(image, overlay1)
-
             k = tf.mod(transform_id, 4, "rotation_idx")
             rotated = tf.image.rot90(image, k, "rotation")
 
@@ -269,87 +244,65 @@ class Trainer(object):
             flipped = tf.image.flip_left_right(rotated)
             signal = tf.cond(tf.equal(tf.div(transform_id, 4), 1), lambda: flipped, lambda: not_flipped)
 
-            # signal = tf.maximum(overlay2, signal)
-            # signal = tf.reshape(signal, [325, 325, 3])
-
-            signal.set_shape([325, 325, 3])
-            if is_image:
-                b, g, r = tf.unstack(signal, 3, 2)
-                signal = tf.stack([r, g, b], 2)
-                # signal = tf.image.per_image_standardization(signal)
-                signal *= 2.
             return signal
+
+    def preprocess_image(self, signal):
+        b, g, r = tf.unstack(signal, 3, 2)
+        signal = tf.stack([r, g, b], 2)
+        return signal
+
+    def load_image(self, image_name):
+        image = tf.read_file(image_name)
+        image = tf.image.decode_jpeg(image, name="jpeg_decoding_2")
+        image.set_shape([650, 650, 3])
+        image = tf.cast(image, self.float) / 255.
+        image = tf.reshape(image, [1, 650, 650, 3])
+        image = tf.image.resize_bilinear(image, size=[325, 325])
+        image = tf.reshape(image, [325, 325, 3])
+        return image
 
     def load_images(self, filename_queue):
         with tf.name_scope("image_loading"):
             image_name, heatmap_name = filename_queue
-
-            image = tf.read_file(image_name)
-            heatmap = tf.read_file(heatmap_name)
-
-            image = tf.image.decode_jpeg(image, name="jpeg_decoding_1")
-            image.set_shape([650, 650, 3])
-            image = tf.cast(image, self.float) / 255.
-            image = tf.reshape(image, [1, 650, 650, 3])
-            image = tf.image.resize_bilinear(image, size=[325, 325])
-            image = tf.reshape(image, [325, 325, 3])
-
-            heatmap = tf.image.decode_jpeg(heatmap, name="jpeg_decoding_2")
-            heatmap.set_shape([650, 650, 3])
-            heatmap = tf.cast(heatmap, self.float) / 255.
-            heatmap = tf.reshape(heatmap, [1, 650, 650, 3])
-            heatmap = tf.image.resize_bilinear(heatmap, size=[325, 325])
-            heatmap = tf.reshape(heatmap, [325, 325, 3])
-
+            image = self.load_image(image_name)
+            heatmap = self.load_image(heatmap_name)
             return image, heatmap
 
-    def create_model(self):
-        print("Creating the model")
+    def create_graph(self):
 
         with tf.name_scope("input_pipeline"):
             transformation_type = tf.random_uniform([], 0, 8, dtype=tf.int32, name="random_transformation_type")
             filename_queue = tf.train.slice_input_producer(self.dataset.get_training_set_filenames())
             image, heatmap = self.load_images(filename_queue)
-            image = self.transform(transformation_type, image, True)
-            heatmap = self.transform(transformation_type, heatmap, False)
+
+            image = self.transform(transformation_type, image)
+            image = self.preprocess_image(image)
+            image.set_shape([325, 325, 3])
+            heatmap = self.transform(transformation_type, heatmap)
+            heatmap.set_shape([325, 325, 3])
+
             x_batch, y_batch = tf.train.shuffle_batch_join([(image, heatmap)] * 24, 32, 512, 32,
                                                            name="shuffle_batch_join")
 
-        with tf.name_scope("test_input_pipeline"):
-            vx_name = tf.placeholder(tf.string, [], "vx_name")
-            vy_name = tf.placeholder(tf.string, [], "vy_name")
-            image, heatmap = self.load_images((vx_name, vy_name))
-            images = [self.transform(transform_id, image, True) for transform_id in range(8)]
-            heatmaps = [self.transform(transform_id, heatmap, False) for transform_id in range(8)]
-            xv_batch = tf.stack(images, 0)
-            yv_batch = tf.stack(heatmaps, 0)
-
-        input_h, input_w = 325, 325
-        target_h, target_w = 336, 336
-        # input_h, input_w = 650, 650
-        # target_h, target_w = 656, 656
-
-        with tf.name_scope("placeholders"):
-            # global_step = tf.Variable(0, dtype=tf.int32, name="global_step")
-
-            #     x = tf.placeholder(dtype=self.float, shape=[None, input_h, input_w, 3], name="x")
-            #     target_y = tf.placeholder(dtype=self.float, shape=[None, input_h, input_w, 3], name="target_y")
-            pass
-
         x = x_batch
         target_y = y_batch
-        signal = x
 
-        with tf.name_scope("main_graph"):
-            signal = tf.image.resize_image_with_crop_or_pad(signal, target_h, target_w)
-            resized_input = signal
-            tf.summary.image("input_image", signal)
-            signal = self.create_u_level(range(5), signal, 3, 16)
-            signal = self.layer_conv(signal, 0, 16, 3, 1, False)
-            signal = tf.image.resize_image_with_crop_or_pad(signal, input_h, input_w)
-            output_image = tf.nn.softmax(signal)
-            tf.summary.image("output_image", output_image)
-            tf.summary.image("target_y", target_y)
+        # is_training = tf.placeholder(tf.bool, [], "is_training")
+
+        # with tf.name_scope("test_input_pipeline"):
+        #     vx_name = tf.placeholder(tf.string, [], "vx_name")
+        #     vy_name = tf.placeholder(tf.string, [], "vy_name")
+        #     image, heatmap = self.load_images((vx_name, vy_name))
+        #     images = [self.transform(transform_id, image, True) for transform_id in range(8)]
+        #     heatmaps = [self.transform(transform_id, heatmap, False) for transform_id in range(8)]
+        #     xv_batch = tf.stack(images, 0)
+        #     yv_batch = tf.stack(heatmaps, 0)
+
+        signal = x
+        with tf.variable_scope("models") as scope:
+            signal = self.create_model(signal, True)
+            scope.reuse_variables()
+            validation = self.create_model(signal, False)
 
         with tf.name_scope("optimisation"):
             loss = tf.reduce_mean(
@@ -364,12 +317,31 @@ class Trainer(object):
             summary_writer.add_graph(self.session.graph)
             summary_writer.flush()
             # sys.exit(42)
+            tf.summary.image("target_y", target_y)
+
             merged_summaries = tf.summary.merge_all()
 
         with tf.name_scope("utilities"):
             saver = tf.train.Saver()
 
         self.model.update(locals())
+
+    def create_model(self, signal, is_training):
+        print("Creating the model")
+
+        input_h, input_w = 325, 325
+        target_h, target_w = 336, 336
+
+        with tf.variable_scope("U_net_model"):
+            signal = tf.image.resize_image_with_crop_or_pad(signal, target_h, target_w)
+            tf.summary.image("input_image", signal)
+            signal = self.create_u_level(range(5), signal, 3, 16, is_training)
+            signal = self.layer_conv(signal, 0, 16, 3, 1, False)
+            signal = tf.image.resize_image_with_crop_or_pad(signal, input_h, input_w)
+            output_image = tf.nn.softmax(signal)
+            tf.summary.image("output_image", output_image)
+
+        return signal
 
     def train_model(self):
         print("Training the model")
@@ -473,7 +445,7 @@ def main(argv):
 
         t.prepare_dataset(dataset_dir=options.dataset)
         print("Creating model")
-        t.create_model()
+        t.create_graph()
         t.train_model()
 
 
