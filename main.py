@@ -79,6 +79,7 @@ class Spacenet2Dataset(object):
 
         self.dataset_size = len(image_names)
         self.validation_set_size = int(self.dataset_size * self.validation_set_size_ratio)
+        self.validation_set_size += (-self.validation_set_size) % 16  # round the size to the multiple of 16
         self.training_set_size = self.dataset_size - self.validation_set_size
 
         self.training_image_names = image_names[:self.training_set_size]
@@ -101,25 +102,25 @@ class Spacenet2Dataset(object):
     def get_validation_set_filenames(self):
         return self.validation_image_names, self.validation_heatmap_names
 
-    def _do_open_images(self):
-        print("Opening images:")
-        print("--> training images")
-        self.training_images = self._open_dataset(self.images_folder, self.training_image_names)
-        print("--> training heatmaps")
-        self.training_heatmaps = self._open_dataset(self.heatmaps_folder, self.training_image_names)
-        print("--> validation images")
-        self.validation_images = self._open_dataset(self.images_folder, self.validation_image_names)
-        print("--> validation heatmaps")
-        self.validation_heatmaps = self._open_dataset(self.heatmaps_folder, self.validation_image_names)
+        # def _do_open_images(self):
+        #     print("Opening images:")
+        #     print("--> training images")
+        #     self.training_images = self._open_dataset(self.images_folder, self.training_image_names)
+        #     print("--> training heatmaps")
+        #     self.training_heatmaps = self._open_dataset(self.heatmaps_folder, self.training_image_names)
+        #     print("--> validation images")
+        #     self.validation_images = self._open_dataset(self.images_folder, self.validation_image_names)
+        #     print("--> validation heatmaps")
+        #     self.validation_heatmaps = self._open_dataset(self.heatmaps_folder, self.validation_image_names)
 
-    def _open_dataset(self, path_prefix, image_name_list):
-        total = len(image_name_list)
-        target_width, target_height = 325, 325
-        res = np.zeros([total, 325, 325, 3], dtype=np.uint8)
-        for i, name in tqdm(enumerate(image_name_list), total=total):
-            with Image.open(os.path.join(path_prefix, name)) as img:
-                res[i, :, :, :] = img.resize([target_width, target_height], Image.BILINEAR)
-        return res
+        # def _open_dataset(self, path_prefix, image_name_list):
+        #     total = len(image_name_list)
+        #     target_width, target_height = 325, 325
+        #     res = np.zeros([total, 325, 325, 3], dtype=np.uint8)
+        #     for i, name in tqdm(enumerate(image_name_list), total=total):
+        #         with Image.open(os.path.join(path_prefix, name)) as img:
+        #             res[i, :, :, :] = img.resize([target_width, target_height], Image.BILINEAR)
+        #     return res
 
 
 class Trainer(object):
@@ -135,9 +136,18 @@ class Trainer(object):
             "validation_set_size": -1,
             "verbosity": 0,
             "training_steps": -1,
-            "input_size": 650,
-            "input_small_size": 325,
+            # "input_size": 650,
+            # "input_small_size": 325,
         }
+
+        self.BATCH_SIZE = 16
+        self.VALIDATION_BATCH_SIZE = 16
+        self.INPUT_SIZE = 650
+        self.IMAGE_SIZE = 325
+
+        self.training_summaries = []
+        self.validation_summaries = []
+
         if parameters is not None:
             self.parameters.update(parameters)
 
@@ -164,7 +174,7 @@ class Trainer(object):
         )
 
         tf.layers.batch_normalization(signal, 3, training=is_training)
-        tf.summary.histogram("conv_{}_W".format(depth), W)
+        self.training_summary(tf.summary.histogram("conv_{}_W".format(depth), W))
 
         signal = tf.nn.conv2d(signal, W, [1, 1, 1, 1], "SAME", name="up_conv_conv2d")
 
@@ -217,9 +227,7 @@ class Trainer(object):
         skip_connection = signal
 
         if len(levels) > 1:  # Not the last layer
-            with tf.name_scope("u_{}_max_pool".format(depth)):
-                signal = self.layer_max_pool_2x2(signal, depth)
-
+            signal = self.layer_max_pool_2x2(signal, depth)
             signal = self.create_u_level(levels[1:], signal, out_fmaps, out_fmaps * 2, is_training)
 
             with tf.variable_scope("u_{}_upconv".format(depth)):
@@ -244,7 +252,14 @@ class Trainer(object):
             flipped = tf.image.flip_left_right(rotated)
             signal = tf.cond(tf.equal(tf.div(transform_id, 4), 1), lambda: flipped, lambda: not_flipped)
 
+            signal.set_shape([self.IMAGE_SIZE, self.IMAGE_SIZE, 3])
             return signal
+
+    def reverse_transform(self, transform_id, image):
+        FULL_ROTATION = 4
+        inverse_rotation = FULL_ROTATION - tf.mod(transform_id, 4, "rotation_idx")
+        flip = tf.div(transform_id, 4)
+        return self.transform(4 * flip + inverse_rotation, image)
 
     def preprocess_image(self, signal):
         b, g, r = tf.unstack(signal, 3, 2)
@@ -254,11 +269,11 @@ class Trainer(object):
     def load_image(self, image_name):
         image = tf.read_file(image_name)
         image = tf.image.decode_jpeg(image, name="jpeg_decoding_2")
-        image.set_shape([650, 650, 3])
+        image.set_shape([self.INPUT_SIZE, self.INPUT_SIZE, 3])
         image = tf.cast(image, self.float) / 255.
-        image = tf.reshape(image, [1, 650, 650, 3])
-        image = tf.image.resize_bilinear(image, size=[325, 325])
-        image = tf.reshape(image, [325, 325, 3])
+        image = tf.reshape(image, [1, self.INPUT_SIZE, self.INPUT_SIZE, 3])
+        image = tf.image.resize_bilinear(image, size=[self.IMAGE_SIZE, self.IMAGE_SIZE])
+        image = tf.reshape(image, [self.IMAGE_SIZE, self.IMAGE_SIZE, 3])
         return image
 
     def load_images(self, filename_queue):
@@ -268,41 +283,25 @@ class Trainer(object):
             heatmap = self.load_image(heatmap_name)
             return image, heatmap
 
-    def create_graph(self):
-
-        with tf.name_scope("input_pipeline"):
+    def create_training_pipeline(self, models_scope):
+        with tf.name_scope("training_input_pipeline"):
             transformation_type = tf.random_uniform([], 0, 8, dtype=tf.int32, name="random_transformation_type")
             filename_queue = tf.train.slice_input_producer(self.dataset.get_training_set_filenames())
             image, heatmap = self.load_images(filename_queue)
 
             image = self.transform(transformation_type, image)
             image = self.preprocess_image(image)
-            image.set_shape([325, 325, 3])
             heatmap = self.transform(transformation_type, heatmap)
-            heatmap.set_shape([325, 325, 3])
 
             x_batch, y_batch = tf.train.shuffle_batch_join([(image, heatmap)] * 24, 32, 512, 32,
                                                            name="shuffle_batch_join")
 
-        x = x_batch
+        signal = x_batch
         target_y = y_batch
+        tf.summary.image("target_y", target_y)
 
-        # is_training = tf.placeholder(tf.bool, [], "is_training")
-
-        # with tf.name_scope("test_input_pipeline"):
-        #     vx_name = tf.placeholder(tf.string, [], "vx_name")
-        #     vy_name = tf.placeholder(tf.string, [], "vy_name")
-        #     image, heatmap = self.load_images((vx_name, vy_name))
-        #     images = [self.transform(transform_id, image, True) for transform_id in range(8)]
-        #     heatmaps = [self.transform(transform_id, heatmap, False) for transform_id in range(8)]
-        #     xv_batch = tf.stack(images, 0)
-        #     yv_batch = tf.stack(heatmaps, 0)
-
-        signal = x
-        with tf.variable_scope("models") as scope:
+        with tf.variable_scope(models_scope):
             signal = self.create_model(signal, True)
-            scope.reuse_variables()
-            validation = self.create_model(signal, False)
 
         with tf.name_scope("optimisation"):
             loss = tf.reduce_mean(
@@ -312,84 +311,179 @@ class Trainer(object):
             optimize_op = AdamOptimizer(0.001, name="Michal", epsilon=1e-4).minimize(loss)
             tf.summary.scalar("loss", loss)
 
+        return locals()
+
+    def create_validation_pipeline(self, models_scope):
+        current_x = tf.Variable(tf.zeros([self.BATCH_SIZE, self.IMAGE_SIZE, self.IMAGE_SIZE, 3]), trainable=False)
+        current_y = tf.Variable(tf.zeros([self.BATCH_SIZE, self.IMAGE_SIZE, self.IMAGE_SIZE, 3]), trainable=False)
+        current_partial_result = tf.Variable(tf.zeros([self.BATCH_SIZE, self.IMAGE_SIZE, self.IMAGE_SIZE, 3]),
+                                             trainable=False)
+        current_x_names = tf.Variable(tf.constant("<empty>", tf.string, [self.BATCH_SIZE]), trainable=False)
+        current_y_names = tf.Variable(tf.constant("<empty>", tf.string, [self.BATCH_SIZE]), trainable=False)
+
+        validation_transrofmation_type = tf.placeholder_with_default(tf.constant(0, dtype=tf.int32), [],
+                                                                     "transformation_type")
+
+        with tf.name_scope("validation_input_pipeline"):
+            image_names = tf.train.slice_input_producer(self.dataset.get_validation_set_filenames(), shuffle=False)
+            image, heatmap = self.load_images(image_names)
+            image_name, heatmap_name = image_names
+
+            # images = [self.transform(transform_id, image, False) for transform_id in range(8)]
+            # heatmaps = [self.transform(transform_id, heatmap, True) for transform_id in range(8)]
+
+            xv_batch, yv_batch, x_names, y_names = tf.train.batch_join([(image, heatmap, image_name, heatmap_name)] * 4,
+                                                                       self.BATCH_SIZE, 256)
+
+            load_new_batch_op = tf.group(
+                tf.assign(current_x, xv_batch),
+                tf.assign(current_y, yv_batch),
+                tf.assign(current_x_names, x_names),
+                tf.assign(current_y_names, y_names)
+            )
+
+        signal = current_x
+
+        with tf.variable_scope(models_scope):
+            # signal = self.transform(validation_transrofmation_type, signal)
+            signal = tf.map_fn(lambda signal: self.transform(validation_transrofmation_type, signal), signal)
+            tf.summary.image("transformed_validation", signal)
+            signal = self.create_model(signal, False)
+            # signal = self.reverse_transform(validation_transrofmation_type, signal)
+            signal = tf.map_fn(lambda signal: self.reverse_transform(validation_transrofmation_type, signal), signal)
+            validation_partial_result = tf.nn.softmax(signal)
+            tf.summary.image("transformed_result", signal)
+            tf.summary.image("partial_result", current_partial_result)
+
+        assign_partial_result_op = tf.assign(
+            current_partial_result,
+            tf.add(current_partial_result, validation_partial_result)
+        )
+
+        reset_result_op = tf.assign(current_partial_result, tf.tile(tf.constant(0., shape=[1, 1, 1, 1]), [16, 325, 325, 3]))
+
+        return locals()
+
+    def create_graph(self):
+        with tf.variable_scope("models") as models_scope_for_reusing:
+            pass
+
+        m_training = self.create_training_pipeline(models_scope_for_reusing)
+        models_scope_for_reusing.reuse_variables()
+        m_validation = self.create_validation_pipeline(models_scope_for_reusing)
+
         with tf.name_scope("summaries"):
             summary_writer = tf.summary.FileWriter("./logs/summaries")
             summary_writer.add_graph(self.session.graph)
             summary_writer.flush()
-            # sys.exit(42)
-            tf.summary.image("target_y", target_y)
-
             merged_summaries = tf.summary.merge_all()
 
         with tf.name_scope("utilities"):
             saver = tf.train.Saver()
 
         self.model.update(locals())
+        self.model.update(m_training)
+        self.model.update(m_validation)
 
     def create_model(self, signal, is_training):
         print("Creating the model")
-
-        input_h, input_w = 325, 325
-        target_h, target_w = 336, 336
+        SIZE = math.ceil(self.IMAGE_SIZE / 16) * 16
+        print("SIZE == {}!".format(SIZE))
 
         with tf.variable_scope("U_net_model"):
-            signal = tf.image.resize_image_with_crop_or_pad(signal, target_h, target_w)
+            signal = tf.image.resize_image_with_crop_or_pad(signal, SIZE, SIZE)
             tf.summary.image("input_image", signal)
             signal = self.create_u_level(range(5), signal, 3, 16, is_training)
             signal = self.layer_conv(signal, 0, 16, 3, 1, False)
-            signal = tf.image.resize_image_with_crop_or_pad(signal, input_h, input_w)
-            output_image = tf.nn.softmax(signal)
-            tf.summary.image("output_image", output_image)
+            signal = tf.image.resize_image_with_crop_or_pad(signal, self.IMAGE_SIZE, self.IMAGE_SIZE)
+            # output_image = tf.nn.softmax(signal)
+            # tf.summary.image("output_image", output_image)
 
         return signal
 
     def train_model(self):
         print("Training the model")
         self.session.run(tf.global_variables_initializer())
-        tf.train.start_queue_runners(self.session)
+        coord = tf.train.Coordinator()
+        threads = tf.train.start_queue_runners(self.session)
         m = self.m
 
         steps = self.parameters["training_steps"]
         small_steps = 100
         big_steps = steps // small_steps
 
-        for big_step in range(big_steps):  # tqdm(range(big_steps), desc="epochs"):
-            # print("TEST", end="") # print here like this
-            # inner_range =
-            for small_step in tqdm(range(small_steps), total=small_steps, desc="steps ", leave=True):
-                _, merged_summaries, loss = self.session.run(
-                    fetches=[
-                        m["optimize_op"],
-                        m["merged_summaries"],
-                        m["loss"],
-                    ],
-                    feed_dict={
-                        # m["global_step"]: big_step * big_steps + step
-                    }
-                )
-                if select.select([sys.stdin, ], [], [], 0.0)[0]:
-                    command = input()
-                    if command == "t":
-                        tqdm.write("WOULD RUN TESTS NOW")
+        self.train_model__report_stats(-1)
 
-                tqdm.write("loss: {}".format(loss))
-                m["summary_writer"].add_summary(merged_summaries, big_step * big_steps + small_step)
+        # for big_step in range(big_steps):  # tqdm(range(big_steps), desc="epochs"):
+        #     for small_step in tqdm(range(small_steps), total=small_steps, desc="steps ", leave=True):
+        #         _, merged_summaries, loss = self.session.run(
+        #             fetches=[
+        #                 m["optimize_op"],
+        #                 m["merged_summaries"],
+        #                 m["loss"],
+        #             ],
+        #             feed_dict={
+        #                 # m["global_step"]: big_step * big_steps + step
+        #             }
+        #         )
+        #         if select.select([sys.stdin, ], [], [], 0.0)[0]:
+        #             command = input()
+        #             if command == "t":
+        #                 tqdm.write("WOULD RUN TESTS NOW")
+        #
+        #         tqdm.write("loss: {}".format(loss))
+        #         m["summary_writer"].add_summary(merged_summaries, big_step * big_steps + small_step)
+        #
+        #     m["summary_writer"].flush()
+        #     self.train_model__report_stats(big_step)
 
-            m["summary_writer"].flush()
-            self.train_model__report_stats(big_step)
+        # stop queues
+        coord.request_stop()
+        coord.join(threads)
+        print("threads joined")
 
     def train_model__report_stats(self, big_step):
-        accuracy = self.session.run(
-            fetches=[
-                # self.m["resized_input"]
-            ],
-            feed_dict={
-            }
-        )
-        print()
-        print("Big step #{} done.".format(big_step))
-        print("-----------------------------\n")
-        # print("\n[{}] accuracy: {}".format(big_step, accuracy))
+        VALIDATION_STEPS = len(self.dataset.get_validation_set_filenames()[0]) // self.VALIDATION_BATCH_SIZE
+        print("VALIDATION STEPS: {}".format(VALIDATION_STEPS))
+
+        for v_step in tqdm(range(VALIDATION_STEPS), total=VALIDATION_STEPS):
+            tqdm.write("validation step: {}".format(v_step))
+
+            tqdm.write("load new batch")
+            self.session.run(self.m["load_new_batch_op"])
+            tqdm.write("reset result op")
+            self.session.run(self.m["reset_result_op"])
+
+            x, y, nx, ny = self.session.run(
+                fetches=[
+                    self.m["current_x"],
+                    self.m["current_y"],
+                    self.m["current_x_names"],
+                    self.m["current_y_names"],
+                ],
+                feed_dict={
+
+                }
+            )
+            tqdm.write("names: \n{} \n {}".format(nx, ny))
+
+            for transformation_type in range(8):
+                tqdm.write("tf_type: {}\n".format(transformation_type))
+                _, merged_summaries = self.session.run(
+                    [
+                        self.m["assign_partial_result_op"],
+                        self.m["merged_summaries"],
+                    ],
+                    feed_dict={
+                        self.m["validation_transrofmation_type"]: transformation_type,
+                    }
+                )
+                self.m["summary_writer"].add_summary(merged_summaries, v_step * 8 + transformation_type)
+                self.m["summary_writer"].flush()
+
+            sys.exit(2)
+
+        tqdm.write("Big step #{} done.".format(big_step))
 
     def save_trained_values(self, name):
         save_path = self.model["saver"].save(self.session,
@@ -426,10 +520,10 @@ def main(argv):
     options = parser.parse_args(argv)
     print(options)
 
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-
-    with tf.Session(config=config) as session:
+    # config = tf.ConfigProto()
+    # config.gpu_options.allow_growth = True
+    # with tf.Session(config=config) as session:
+    with tf.Session() as session:
         if options.debug:
             print("Running in debug mode")
             from tensorflow.python import debug as tf_debug
