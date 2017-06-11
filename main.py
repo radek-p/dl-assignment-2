@@ -7,9 +7,11 @@ import argparse
 import sys
 import os
 import random
-from tensorflow.python.training.adam import AdamOptimizer
+# from tensorflow.python.training.adam import AdamOptimizer
 from tqdm import tqdm
 import utility
+import numpy as np
+from PIL import Image
 
 
 class Spacenet2Dataset(object):
@@ -98,26 +100,6 @@ class Spacenet2Dataset(object):
     def get_validation_set_filenames(self):
         return self.validation_image_names, self.validation_heatmap_names
 
-        # def _do_open_images(self):
-        #     print("Opening images:")
-        #     print("--> training images")
-        #     self.training_images = self._open_dataset(self.images_folder, self.training_image_names)
-        #     print("--> training heatmaps")
-        #     self.training_heatmaps = self._open_dataset(self.heatmaps_folder, self.training_image_names)
-        #     print("--> validation images")
-        #     self.validation_images = self._open_dataset(self.images_folder, self.validation_image_names)
-        #     print("--> validation heatmaps")
-        #     self.validation_heatmaps = self._open_dataset(self.heatmaps_folder, self.validation_image_names)
-
-        # def _open_dataset(self, path_prefix, image_name_list):
-        #     total = len(image_name_list)
-        #     target_width, target_height = 325, 325
-        #     res = np.zeros([total, 325, 325, 3], dtype=np.uint8)
-        #     for i, name in tqdm(enumerate(image_name_list), total=total):
-        #         with Image.open(os.path.join(path_prefix, name)) as img:
-        #             res[i, :, :, :] = img.resize([target_width, target_height], Image.BILINEAR)
-        #     return res
-
 
 class Trainer(object):
     def __init__(self, tf_session, parameters=None):
@@ -131,6 +113,8 @@ class Trainer(object):
             "validation_set_size": -1,
             "verbosity": 0,
             "training_steps": -1,
+            "image_output_dir": "img_samples",
+            "save_path_prefix": "./checkpoints",
         }
 
         if parameters is not None:
@@ -140,7 +124,8 @@ class Trainer(object):
             if self.parameters[parameter] is None or self.parameters[parameter] == -1:
                 print("Missing value for parameter: '{}', program may not work correctly.".format(parameter))
 
-        self.BATCH_SIZE = 16
+        # self.BATCH_SIZE = 16
+        self.TRAINING_BATCH_SIZE = 32
         self.VALIDATION_BATCH_SIZE = 16
         self.INPUT_SIZE = 650
         self.IMAGE_SIZE = 325
@@ -151,6 +136,8 @@ class Trainer(object):
 
         print("Images will be shuffled with \t--seed={}".format(self.parameters["seed"]))
         self.generator = random.Random(self.parameters["seed"])
+
+        self.variables_to_reset = []
 
     def prepare_dataset(self, dataset_dir):
         print("Loading dataset")
@@ -211,6 +198,11 @@ class Trainer(object):
 
     def create_training_pipeline(self, models_scope):
         with tf.name_scope("training_input_pipeline"):
+            t_x = tf.Variable(tf.zeros([self.TRAINING_BATCH_SIZE, self.IMAGE_SIZE, self.IMAGE_SIZE, 3]),
+                              trainable=False, name="t_x")
+            t_y = tf.Variable(tf.zeros([self.TRAINING_BATCH_SIZE, self.IMAGE_SIZE, self.IMAGE_SIZE, 3]),
+                              trainable=False, name="t_y")
+
             t_tf_type = tf.random_uniform([], 0, 8, dtype=tf.int32, name="t_tf_type")
             t_file_names = tf.train.slice_input_producer(self.dataset.get_training_set_filenames())
 
@@ -219,25 +211,53 @@ class Trainer(object):
             t_image = self.preprocess_image(t_image)
             t_heatmap = self.transform(t_tf_type, t_heatmap)
 
-            t_x, t_y = tf.train.shuffle_batch_join([(t_image, t_heatmap)] * 24, 32, 512, 32, name="t_shuffle_batch")
+            t_x_batch, t_y_batch = tf.train.shuffle_batch_join([(t_image, t_heatmap)] * 24, self.TRAINING_BATCH_SIZE,
+                                                               512, 32, name="t_shuffle_batch")
+
+            t_load_next_batch_op = tf.group(
+                tf.assign(t_x, t_x_batch),
+                tf.assign(t_y, t_y_batch)
+            )
 
         with tf.variable_scope(models_scope):
             signal = t_x
             b = utility.ModelBuilder(self.IMAGE_SIZE)
             signal = b.create_model(signal, True)
             self.training_summaries += b.summaries
-            output_image = tf.nn.softmax(signal)
+            t_output_image = tf.nn.softmax(signal)
 
-        with tf.name_scope("optimisation"):
-            loss = tf.reduce_mean(
-                tf.nn.softmax_cross_entropy_with_logits(labels=t_y, logits=signal, name="softmax_loss")
-            )
-            t_optimize_op = AdamOptimizer(0.001, epsilon=1e-4).minimize(loss, name="t_optimize_op")
+        with tf.name_scope("t_optimisation"):
+            t_error_map = tf.nn.softmax_cross_entropy_with_logits(labels=t_y, logits=signal, name="softmax_loss")
+            t_d0 = t_y[:, :, :, 1]
+            t_d0 = tf.reshape(t_d0, [self.TRAINING_BATCH_SIZE, self.IMAGE_SIZE, self.IMAGE_SIZE, 1])
+            t_d1 = tf.nn.dilation2d(t_d0, tf.ones([3, 3, 1]), [1, 1, 1, 1], [1, 1, 1, 1], "SAME")
+            t_d2 = tf.nn.dilation2d(t_d1, tf.ones([3, 3, 1]), [1, 1, 1, 1], [1, 1, 1, 1], "SAME")
+            t_d3 = tf.nn.dilation2d(t_d2, tf.ones([3, 3, 1]), [1, 1, 1, 1], [1, 1, 1, 1], "SAME")
+            t_d3 = t_d3[:, :, :, 0]
+            t_d3_normalized = t_d3 / tf.reduce_max(t_d3)
+            t_error_severeness = tf.ones(t_error_map.get_shape()) + t_d3 * 40
+            t_error_map_augmented = t_error_map * t_error_severeness
+            t_error_map_normalized = t_error_map / tf.reduce_max(t_error_map)
+            t_error_map_augmented_normalized = t_error_map_augmented / tf.reduce_max(t_error_map_augmented)
+            t_loss = tf.reduce_mean(t_error_map)
+            t_loss2 = tf.reduce_mean(t_error_map_augmented)
+
+            update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+            with tf.control_dependencies(update_ops):
+                # variables0 = tf.global_variables()
+                optimizer = tf.train.AdamOptimizer(0.001, epsilon=1e-4)
+                # optimizer = tf.train.MomentumOptimizer(0.001, momentum=0.9)
+                t_optimize_op = optimizer.minimize(t_loss, name="t_optimize_op")
+                t_optimize_op2 = optimizer.minimize(t_loss2, name="t_optimize_op2")
+                # variables1 = tf.global_variables()
+                # t_optimize_op = tf.train.GradientDescentOptimizer(0.00001).minimize(t_loss, name="t_optimize_op2")
+                # self.variables_to_reset = [var for var in variables1 if var not in variables0]
 
         self.training_summaries += [
-            tf.summary.scalar("t_loss", loss),
-            tf.summary.image("t_y", t_y),
-            tf.summary.image("t_output_image", output_image),
+            tf.summary.scalar("t_loss", t_loss),
+            tf.summary.scalar("t_loss", t_loss2),
+            # tf.summary.image("t_y", t_y),
+            # tf.summary.image("t_output_image", t_output_image),
         ]
 
         return locals()
@@ -249,17 +269,21 @@ class Trainer(object):
             v_y = tf.Variable(tf.zeros(v_img_shape), trainable=False, name="v_y")
             v_tf_average_result = tf.Variable(tf.zeros(v_img_shape), trainable=False, name="v_tf_average_result")
             v_tf_average_result_sums = tf.reduce_sum(v_tf_average_result, axis=3)
-            v_x_names = tf.Variable(tf.constant("$", tf.string, [self.BATCH_SIZE]), trainable=False, name="v_x_names")
-            v_y_names = tf.Variable(tf.constant("$", tf.string, [self.BATCH_SIZE]), trainable=False, name="v_y_names")
+            v_x_names = tf.Variable(tf.constant("$", tf.string, [self.VALIDATION_BATCH_SIZE]), trainable=False,
+                                    name="v_x_names")
+            v_y_names = tf.Variable(tf.constant("$", tf.string, [self.VALIDATION_BATCH_SIZE]), trainable=False,
+                                    name="v_y_names")
 
+            v_tf_num = tf.Variable(tf.zeros([]), trainable=False, name="v_tf_num")
             v_tf_type = tf.placeholder_with_default(tf.constant(0, dtype=tf.int32), [], "v_tf_type")
 
             v_file_names = tf.train.slice_input_producer(self.dataset.get_validation_set_filenames(), shuffle=False)
             v_x1_name, v_y1_name = v_file_names
             v_x1, v_y1 = self.load_images(v_file_names)
+            v_x1 = self.preprocess_image(v_x1)
 
             v_x_batch, v_y_batch, v_x_batch_names, v_y_batch_names = tf.train.batch_join(
-                [(v_x1, v_y1, v_x1_name, v_y1_name)] * 4, self.VALIDATION_BATCH_SIZE, 256
+                [(v_x1, v_y1, v_x1_name, v_y1_name)] * 20, self.VALIDATION_BATCH_SIZE, 256
             )
 
         with tf.variable_scope(models_scope):
@@ -275,16 +299,18 @@ class Trainer(object):
             signal = tf.map_fn(lambda signal_slice: self.reverse_transform(v_tf_type, signal_slice), signal)
             v_tf_single_result = tf.nn.softmax(signal)
 
-            v_transformed_result = signal
+            # v_reverse_transformed_result = signal
 
-            v_average_output_loss = -tf.reduce_mean(
-                v_y * tf.log(tf.clip_by_value(tf.divide(v_tf_average_result, 8.), 1e-10, 1.0))
-            )
+            v_mean_result = tf.divide(v_tf_average_result, v_tf_num)
+            # fix error map -- should be divided by max sum, not by 8
+            v_error_map = tf.reduce_sum(-(v_y * tf.log(tf.clip_by_value(v_mean_result, 1e-10, 1.0))), axis=3)
+            v_error_map_normalized = v_error_map / tf.reduce_max(v_error_map)
+            v_average_output_loss = tf.reduce_mean(v_error_map)
 
             self.validation_summaries += [
-                tf.summary.image("v_transformed_input", v_transformed_input),
-                tf.summary.image("v_transformed_result", v_transformed_result),
-                tf.summary.image("v_tf_average_result", v_tf_average_result),
+                # tf.summary.image("v_transformed_input", v_transformed_input),
+                # tf.summary.image("v_transformed_result", v_transformed_result),
+                # tf.summary.image("v_tf_average_result", v_tf_average_result),
                 tf.summary.scalar("v_average_output_loss", v_average_output_loss),
             ]
 
@@ -296,14 +322,20 @@ class Trainer(object):
                 tf.assign(v_y_names, v_y_batch_names)
             )
 
-            v_add_partial_result = tf.assign(
-                v_tf_average_result,
-                tf.add(v_tf_average_result, v_tf_single_result)
+            v_add_partial_result = tf.group(
+                tf.assign(
+                    v_tf_average_result,
+                    tf.add(v_tf_average_result, v_tf_single_result)
+                ),
+                tf.assign(v_tf_num, v_tf_num + 1)
             )
 
-            v_reset_average_result = tf.assign(
-                v_tf_average_result,
-                tf.tile(tf.constant(0., shape=[1, 1, 1, 1]), v_img_shape)
+            v_reset_average_result = tf.group(
+                tf.assign(
+                    v_tf_average_result,
+                    tf.tile(tf.constant(0., shape=[1, 1, 1, 1]), v_img_shape)
+                ),
+                tf.assign(v_tf_num, 0)
             )
 
         return locals()
@@ -336,43 +368,47 @@ class Trainer(object):
 
     def train_model(self):
         print("Training the model")
-        self.session.run(tf.global_variables_initializer())
         coord = tf.train.Coordinator()
         threads = tf.train.start_queue_runners(self.session)
         m = self.m
 
         steps = self.parameters["training_steps"]
-        small_steps = 200
+        small_steps = 2000
         big_steps = steps // small_steps
 
-        for big_step in range(big_steps):  # tqdm(range(big_steps), desc="epochs"):
+        # self.validate_model(-1, save_summaries=False)
+
+        for big_step in range(big_steps):
             for small_step in tqdm(range(small_steps), total=small_steps, desc="steps ", leave=True):
-                _, t_merged_summaries, loss = self.session.run(
+
+                self.session.run(m["t_load_next_batch_op"])
+
+                _, t_merged_summaries, loss1, loss2 = self.session.run(
                     fetches=[
                         m["t_optimize_op"],
                         m["t_merged_summaries"],
-                        m["loss"],
+                        m["t_loss"],
+                        m["t_loss2"],
                     ],
-                    feed_dict={}
                 )
-                if select.select([sys.stdin, ], [], [], 0.0)[0]:
-                    command = input()
-                    if command == "t":
-                        tqdm.write("RUNNING TESTS ON REQUEST")
-                        self.train_model__report_stats(big_step)
 
-                tqdm.write("loss: {}".format(loss))
-                m["t_summary_writer"].add_summary(t_merged_summaries, big_step * big_steps + small_step)
+                if small_step % 50 == 0:
+                    images = self.session.run([m["t_x"], m["t_y"], m["t_output_image"], m["t_error_map_normalized"],
+                                               m["t_error_map_augmented_normalized"], m["t_d3_normalized"]])
+                    self.output_batch_stats(*images, label="t_b{:04d}_s{:04d}".format(big_step, small_step))
+
+                tqdm.write("loss: {},\t{}".format(loss1, loss2))
+                m["t_summary_writer"].add_summary(t_merged_summaries, big_step * small_steps + small_step)
                 m["t_summary_writer"].flush()
 
-            self.train_model__report_stats(big_step * big_steps, save_summaries=small_step % 50 == 0)
+            self.save_trained_values("big-step")
+            self.validate_model(big_step * big_steps, save_summaries=small_step % 50 == 0)
             tqdm.write("Big step #{} done.".format(big_step))
 
         coord.request_stop()
         coord.join(threads)
-        print("threads joined")
 
-    def train_model__report_stats(self, training_step, save_summaries=False):
+    def validate_model(self, training_step, save_summaries=False):
         m = self.m
         loss_sum = 0.
 
@@ -394,18 +430,46 @@ class Trainer(object):
                     }
                 )
 
-                # if save_summaries:
-                m["v_summary_writer"].add_summary(v_merged_summaries, training_step + v_step * 8 + transformation_type)
-                m["v_summary_writer"].flush()
+                if v_step % 100 == 0:
+                    images = self.session.run(
+                        fetches=[
+                            m["v_x"],
+                            m["v_y"],
+                            m["v_transformed_input"],
+                            m["v_tf_single_result"],
+                            m["v_mean_result"],
+                            m["v_error_map_normalized"],
+                        ],
+                        feed_dict={
+                            m["v_tf_type"]: transformation_type,
+                        }
+                    )
+                    self.output_batch_stats(*images,
+                                            label="v_t{:04d}_s{:04d}_t{:04d}".format(training_step, v_step,
+                                                                                     transformation_type))
 
-                # average_output_sums = self.session.run(m["v_tf_average_result_sums"])
-                # tqdm.write("average_output: min={}, max={}".format(average_output_sums.min(), average_output_sums.max()))
+                    # if save_summaries:
+                    # m["v_summary_writer"].add_summary(v_merged_summaries, training_step + v_step * 8 + transformation_type)
+                    # m["v_summary_writer"].flush()
+
+                    # average_output_sums = self.session.run(m["v_tf_average_result_sums"])
+                    # tqdm.write("average_output: min={}, max={}".format(average_output_sums.min(), average_output_sums.max()))
 
             loss, = self.session.run([
                 m["v_average_output_loss"],
             ])
             loss_sum += loss
             tqdm.write("===> LOSS = {}, VAVLOSS = {}".format(loss, loss_sum / (v_step + 1)))
+
+    def output_batch_stats(self, *args, label):
+        cols = [np.clip(np.concatenate(col, 0) * 255, 0, 255).astype(np.uint8) for col in args]
+        for i in range(len(cols)):
+            # jeśli obrazek jest 1-kanałowy, przekształcamy go na 3-kanałowy
+            if len(cols[i].shape) == 2:
+                cols[i] = np.reshape(cols[i], cols[i].shape + (1,))
+                cols[i] = np.tile(cols[i], [1, 1, 3])
+        img = Image.fromarray(np.concatenate(cols, 1))
+        img.save("{}/{}.png".format(self.parameters["image_output_dir"], label))
 
     def save_trained_values(self, name):
         save_path = self.model["saver"].save(self.session,
@@ -416,6 +480,12 @@ class Trainer(object):
         checkpoint_path = '{}/{}.ckpt'.format(self.parameters["save_path_prefix"], name)
         self.model["saver"].restore(self.session, checkpoint_path)
         print("Model values restored from checkpoint: {}".format(checkpoint_path))
+
+    def init_values(self, checkpoint):
+        if checkpoint == "":
+            self.session.run(tf.global_variables_initializer())
+        else:
+            self.load_trained_values(checkpoint)
 
 
 def main(argv):
@@ -434,8 +504,10 @@ def main(argv):
             raise argparse.ArgumentTypeError("{} not in range (0.0, 1.0)".format(ratio))
         return ratio
 
-    parser.add_argument("--validation-set-size", required=False, default=0.2, type=validation_set_size_type,
+    parser.add_argument("--validation-set-size", required=False, default=0.10, type=validation_set_size_type,
                         help="fraction of images to use during validation")
+    parser.add_argument("--start-from-checkpoint", required=False, default="",
+                        help="checkpoint location")
 
     options = parser.parse_args(argv)
     # print(options)
@@ -457,7 +529,14 @@ def main(argv):
         t.prepare_dataset(dataset_dir=options.dataset)
         print("Creating model")
         t.create_graph()
-        t.train_model()
+        # print(t.variables_to_reset)
+        t.init_values(options.start_from_checkpoint)
+        # session.run(tf.variables_initializer(t.variables_to_reset))
+        try:
+            t.train_model()
+        except KeyboardInterrupt:
+            print("Interrupted, saving")
+            t.save_trained_values("interrupt")
 
 
 if __name__ == '__main__':
