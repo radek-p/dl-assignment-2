@@ -3,3 +3,5 @@ experiments/
 .DS_Store
 .idea/
 logs/
+__pycache__/
+img_samples/
