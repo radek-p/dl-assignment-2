@@ -1,13 +1,11 @@
 # Autor:
 # Radosław Piórkowski
 # nr indeksu: 335451
-import select
 import tensorflow as tf
 import argparse
 import sys
 import os
 import random
-# from tensorflow.python.training.adam import AdamOptimizer
 from tqdm import tqdm
 import utility
 import numpy as np
@@ -115,6 +113,8 @@ class Trainer(object):
             "training_steps": -1,
             "image_output_dir": "img_samples",
             "save_path_prefix": "./checkpoints",
+            "start_from_step": 0,
+            "run_idx": -1,
         }
 
         if parameters is not None:
@@ -124,7 +124,6 @@ class Trainer(object):
             if self.parameters[parameter] is None or self.parameters[parameter] == -1:
                 print("Missing value for parameter: '{}', program may not work correctly.".format(parameter))
 
-        # self.BATCH_SIZE = 16
         self.TRAINING_BATCH_SIZE = 32
         self.VALIDATION_BATCH_SIZE = 16
         self.INPUT_SIZE = 650
@@ -134,10 +133,13 @@ class Trainer(object):
         self.training_summaries = []
         self.validation_summaries = []
 
+        self.parameters["image_output_dir"] = "img_samples_{}".format(self.parameters["run_idx"])
+        if not os.path.exists(self.parameters["image_output_dir"]):
+            os.makedirs(self.parameters["image_output_dir"])
+            print(self.parameters["image_output_dir"] + " directory created.")
+
         print("Images will be shuffled with \t--seed={}".format(self.parameters["seed"]))
         self.generator = random.Random(self.parameters["seed"])
-
-        self.variables_to_reset = []
 
     def prepare_dataset(self, dataset_dir):
         print("Loading dataset")
@@ -244,20 +246,13 @@ class Trainer(object):
 
             update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
             with tf.control_dependencies(update_ops):
-                # variables0 = tf.global_variables()
                 optimizer = tf.train.AdamOptimizer(0.001, epsilon=1e-4)
-                # optimizer = tf.train.MomentumOptimizer(0.001, momentum=0.9)
                 t_optimize_op = optimizer.minimize(t_loss, name="t_optimize_op")
                 t_optimize_op2 = optimizer.minimize(t_loss2, name="t_optimize_op2")
-                # variables1 = tf.global_variables()
-                # t_optimize_op = tf.train.GradientDescentOptimizer(0.00001).minimize(t_loss, name="t_optimize_op2")
-                # self.variables_to_reset = [var for var in variables1 if var not in variables0]
 
         self.training_summaries += [
             tf.summary.scalar("t_loss", t_loss),
             tf.summary.scalar("t_loss", t_loss2),
-            # tf.summary.image("t_y", t_y),
-            # tf.summary.image("t_output_image", t_output_image),
         ]
 
         return locals()
@@ -349,8 +344,8 @@ class Trainer(object):
         m_validation = self.create_validation_pipeline(models_scope_for_reusing)
 
         with tf.name_scope("summaries"):
-            t_summary_writer = tf.summary.FileWriter("./logs/training")
-            v_summary_writer = tf.summary.FileWriter("./logs/validation")
+            t_summary_writer = tf.summary.FileWriter("./logs/training_{}".format(self.parameters["run_idx"]))
+            v_summary_writer = tf.summary.FileWriter("./logs/validation_{}".format(self.parameters["run_idx"]))
 
             for sw in [t_summary_writer, v_summary_writer]:
                 sw.add_graph(self.session.graph)
@@ -375,40 +370,41 @@ class Trainer(object):
         steps = self.parameters["training_steps"]
         small_steps = 2000
         big_steps = steps // small_steps
+        offset = self.parameters["start_from_step"]
 
-        # self.validate_model(-1, save_summaries=False)
+        self.validate_model(-1)
 
         for big_step in range(big_steps):
-            for small_step in tqdm(range(small_steps), total=small_steps, desc="steps ", leave=True):
+            for small_step in tqdm(range(small_steps), total=small_steps, desc=("epoch {}/{} ".format(big_step, big_steps)), leave=True):
+                step = offset + big_step * small_steps + small_step
 
                 self.session.run(m["t_load_next_batch_op"])
 
                 _, t_merged_summaries, loss1, loss2 = self.session.run(
                     fetches=[
-                        m["t_optimize_op"],
-                        m["t_merged_summaries"],
-                        m["t_loss"],
-                        m["t_loss2"],
+                        m["t_optimize_op"], m["t_merged_summaries"], m["t_loss"], m["t_loss2"],
                     ],
                 )
 
-                if small_step % 50 == 0:
+                if small_step % 200 == 0:
                     images = self.session.run([m["t_x"], m["t_y"], m["t_output_image"], m["t_error_map_normalized"],
                                                m["t_error_map_augmented_normalized"], m["t_d3_normalized"]])
                     self.output_batch_stats(*images, label="t_b{:04d}_s{:04d}".format(big_step, small_step))
 
-                tqdm.write("loss: {},\t{}".format(loss1, loss2))
-                m["t_summary_writer"].add_summary(t_merged_summaries, big_step * small_steps + small_step)
+                if small_step % 10 == 0:
+                    tqdm.write("loss: {},\t{}".format(loss1, loss2))
+
+                m["t_summary_writer"].add_summary(t_merged_summaries, step)
                 m["t_summary_writer"].flush()
 
             self.save_trained_values("big-step")
-            self.validate_model(big_step * big_steps, save_summaries=small_step % 50 == 0)
+            self.validate_model(big_step * big_steps)
             tqdm.write("Big step #{} done.".format(big_step))
 
         coord.request_stop()
         coord.join(threads)
 
-    def validate_model(self, training_step, save_summaries=False):
+    def validate_model(self, training_step):
         m = self.m
         loss_sum = 0.
 
@@ -419,7 +415,6 @@ class Trainer(object):
             self.session.run(m["v_load_next_batch"])
 
             for transformation_type in range(8):
-                tqdm.write("tf_type: {}".format(transformation_type), end=", ")
                 _, v_merged_summaries = self.session.run(
                     [
                         m["v_add_partial_result"],
@@ -433,33 +428,33 @@ class Trainer(object):
                 if v_step % 100 == 0:
                     images = self.session.run(
                         fetches=[
-                            m["v_x"],
-                            m["v_y"],
-                            m["v_transformed_input"],
-                            m["v_tf_single_result"],
-                            m["v_mean_result"],
+                            m["v_x"], m["v_y"], m["v_transformed_input"], m["v_tf_single_result"], m["v_mean_result"],
                             m["v_error_map_normalized"],
                         ],
                         feed_dict={
                             m["v_tf_type"]: transformation_type,
                         }
                     )
-                    self.output_batch_stats(*images,
-                                            label="v_t{:04d}_s{:04d}_t{:04d}".format(training_step, v_step,
-                                                                                     transformation_type))
-
-                    # if save_summaries:
-                    # m["v_summary_writer"].add_summary(v_merged_summaries, training_step + v_step * 8 + transformation_type)
-                    # m["v_summary_writer"].flush()
-
-                    # average_output_sums = self.session.run(m["v_tf_average_result_sums"])
-                    # tqdm.write("average_output: min={}, max={}".format(average_output_sums.min(), average_output_sums.max()))
+                    self.output_batch_stats(
+                        *images,
+                        label="v_r{:02d}_t{:04d}_s{:04d}_t{:04d}".format(
+                            self.parameters["run_idx"], training_step, v_step, transformation_type
+                        )
+                    )
 
             loss, = self.session.run([
                 m["v_average_output_loss"],
             ])
             loss_sum += loss
             tqdm.write("===> LOSS = {}, VAVLOSS = {}".format(loss, loss_sum / (v_step + 1)))
+            tqdm.write("TX DONE")
+
+        tqdm.write("TRANSFORM DONE")
+
+        average_validation_loss = loss_sum / self.VALIDATION_STEPS
+        summary = tf.Summary(value=[tf.Summary.Value(tag="average_validation_loss", simple_value=average_validation_loss)])
+        m["v_summary_writer"].add_summary(summary, global_step=training_step)
+        m["v_summary_writer"].flush()
 
     def output_batch_stats(self, *args, label):
         cols = [np.clip(np.concatenate(col, 0) * 255, 0, 255).astype(np.uint8) for col in args]
@@ -495,7 +490,10 @@ def main(argv):
     parser.add_argument("--debug", required=False, action="store_true", help="Turn on TF Debugger.")
     parser.add_argument("--seed", required=False, default=random.randint(0, sys.maxsize), type=int,
                         help="Set seed for pseudo-random shuffle of data.")
-    parser.add_argument("--training-steps", required=False, default=10000, type=int,
+    parser.add_argument("--start-from-step", required=False, default=0, type=int,
+                        help="Idx of first step -- used when state was saved to checkpoint to ensure consistent "
+                             "numbering.")
+    parser.add_argument("--training-steps", required=False, default=50000, type=int,
                         help="Number of training steps.")
 
     def validation_set_size_type(ratio_str):
@@ -510,7 +508,6 @@ def main(argv):
                         help="checkpoint location")
 
     options = parser.parse_args(argv)
-    # print(options)
 
     with tf.Session() as session:
         if options.debug:
@@ -524,19 +521,29 @@ def main(argv):
             "validation_set_size": options.validation_set_size,
             "verbosity": 3 if options.verbose else 0,
             "training_steps": options.training_steps,
+            "start_from_step": options.start_from_step,
+            "run_idx": get_run_idx(),
         })
 
         t.prepare_dataset(dataset_dir=options.dataset)
         print("Creating model")
         t.create_graph()
-        # print(t.variables_to_reset)
         t.init_values(options.start_from_checkpoint)
-        # session.run(tf.variables_initializer(t.variables_to_reset))
         try:
             t.train_model()
         except KeyboardInterrupt:
             print("Interrupted, saving")
             t.save_trained_values("interrupt")
+
+
+def get_run_idx():
+    idx = 0
+    while os.path.exists("logs/training_{}".format(idx)):
+        print("EXISTS logs/training_{}".format(idx))
+        idx += 1
+
+    print("choosing logs/training_{}".format(idx))
+    return idx
 
 
 if __name__ == '__main__':
